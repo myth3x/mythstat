@@ -1,0 +1,724 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# MythStat - Lightweight Zero-Dependency Fastfetch & Monitoring Tool
+# https://myth3x.com/mythstat
+# ==============================================================================
+
+MY_VERSION="1.1.0"
+SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
+CONF="${MYTHSTAT_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/mythstat/config}"
+
+# Optional config (plain shell: MYTHSTAT_WEBHOOK=..., MYTHSTAT_RAM_WARN=90, ...)
+[ -r "$CONF" ] && . "$CONF" 2>/dev/null
+
+# ---- global flags (position independent) ------------------------------------
+args=()
+for a in "$@"; do
+    case "$a" in
+        --no-color) NO_COLOR=1 ;;
+        --offline)  MYTHSTAT_NO_NET=1 ;;
+        *) args+=("$a") ;;
+    esac
+done
+set -- "${args[@]}"
+CMD="$1"
+
+# ANSI Colors
+if [ -n "$NO_COLOR" ]; then
+    c0="" bold="" dim="" c_red="" c_green="" c_yellow="" c_blue="" c_magenta="" c_cyan="" c_white="" c_dots=""
+else
+    c0="\033[0m" bold="\033[1m" dim="\033[2m"
+    c_red="\033[1;31m" c_green="\033[1;32m" c_yellow="\033[1;33m" c_blue="\033[1;34m"
+    c_magenta="\033[1;35m" c_cyan="\033[1;36m" c_white="\033[1;37m"
+fi
+
+# Notice if recently auto-updated
+if [ -f /tmp/.mythstat_updated ]; then
+    echo -e "${c_green}[MythStat]${c0} Automatically updated to version ${bold}v${MY_VERSION}${c0}!\n"
+    rm -f /tmp/.mythstat_updated 2>/dev/null
+fi
+
+# ==============================================================================
+# Collectors
+# ==============================================================================
+have() { command -v "$1" >/dev/null 2>&1; }
+
+draw_bar() {
+    local pct=$1 width=${2:-12}
+    local filled=$(( (pct * width) / 100 )) empty
+    [ $filled -gt $width ] && filled=$width
+    [ $filled -lt 0 ] && filled=0
+    empty=$(( width - filled ))
+    local color="$c_green"
+    [ "$pct" -ge 70 ] && color="$c_yellow"
+    [ "$pct" -ge 85 ] && color="$c_red"
+    local bar="" i
+    for ((i=0; i<filled; i++)); do bar="${bar}█"; done
+    for ((i=0; i<empty; i++)); do bar="${bar}░"; done
+    printf "${color}[%s]${c0}" "$bar"
+}
+
+jesc() { local s=${1//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\t'/ }; printf '%s' "$s"; }
+
+human_bytes() { awk -v b="$1" 'BEGIN{s="B KB MB GB TB";split(s,u," ");i=1;while(b>=1024&&i<5){b/=1024;i++}printf (i==1?"%d %s":"%.1f %s"),b,u[i]}'; }
+
+default_iface() { ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1);exit}}'; }
+
+net_bytes() { # iface -> "rx tx"
+    sed 's/:/ /' /proc/net/dev 2>/dev/null | awk -v i="$1" '$1==i {print $2, $10}'
+}
+
+collect_basic() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        distro_id="${ID:-linux}"; os_name="${PRETTY_NAME:-$NAME}"
+    else
+        distro_id="linux"; os_name="$(uname -s)"
+    fi
+    arch="$(uname -m)"; kernel="$(uname -r)"
+    virt=""
+    if have systemd-detect-virt; then
+        v=$(systemd-detect-virt 2>/dev/null)
+        [ -n "$v" ] && [ "$v" != "none" ] && virt=" ($v)"
+    fi
+    if [ -r /proc/uptime ]; then
+        up_sec=$(cut -d. -f1 /proc/uptime)
+        days=$((up_sec / 86400)); hours=$(((up_sec % 86400) / 3600)); mins=$(((up_sec % 3600) / 60))
+        uptime_str=""
+        [ $days -gt 0 ] && uptime_str="${days}d "
+        [ $hours -gt 0 ] && uptime_str="${uptime_str}${hours}h "
+        uptime_str="${uptime_str}${mins}m"
+    else
+        up_sec=0
+        uptime_str=$(uptime 2>/dev/null | awk -F"(,|up )" '{print $2}' | xargs)
+    fi
+    cpu_model=$(grep -m1 "model name" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs)
+    [ -z "$cpu_model" ] && cpu_model=$(grep -m1 "Hardware" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs)
+    [ -z "$cpu_model" ] && cpu_model="Generic CPU"
+    cores=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)
+    user_host="$(whoami)@$(hostname)"
+}
+
+collect_mem() {
+    ram_total_kb=$(awk '/^MemTotal/{print $2}' /proc/meminfo 2>/dev/null)
+    ram_avail_kb=$(awk '/^MemAvailable/{print $2}' /proc/meminfo 2>/dev/null)
+    ram_total_mb=0; ram_used_mb=0; ram_pct=0
+    if [ -n "$ram_total_kb" ] && [ -n "$ram_avail_kb" ]; then
+        ram_total_mb=$((ram_total_kb / 1024))
+        ram_used_mb=$(((ram_total_kb - ram_avail_kb) / 1024))
+        [ $ram_total_mb -gt 0 ] && ram_pct=$(((ram_used_mb * 100) / ram_total_mb))
+    fi
+    swap_total_mb=$(awk '/^SwapTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null)
+    swap_free_mb=$(awk '/^SwapFree/{print int($2/1024)}' /proc/meminfo 2>/dev/null)
+    swap_total_mb=${swap_total_mb:-0}; swap_used_mb=$((swap_total_mb - ${swap_free_mb:-0})); swap_pct=0
+    [ $swap_total_mb -gt 0 ] && swap_pct=$(((swap_used_mb * 100) / swap_total_mb))
+}
+
+fmt_mem() { # used_mb total_mb pct
+    if [ "$2" -gt 2048 ]; then
+        awk -v u="$1" -v t="$2" -v p="$3" 'BEGIN{printf "%.2f GB / %.2f GB (%d%%)", u/1024, t/1024, p}'
+    else
+        printf '%s MB / %s MB (%s%%)' "$1" "$2" "$3"
+    fi
+}
+
+collect_disk() {
+    disk_type="SSD"
+    if ls /dev/nvme* >/dev/null 2>&1; then disk_type="NVMe"
+    elif grep -qs "1" /sys/block/*/queue/rotational 2>/dev/null; then disk_type="HDD"; fi
+    read -r disk_pct disk_used disk_total < <(df -h / 2>/dev/null | awk 'NR==2{p=$5; gsub(/%/,"",p); print p, $3, $2}')
+    disk_pct=${disk_pct:-0}
+    disk_str="$(echo "$disk_used" | sed -E 's/([0-9.]+)([KMGT])/\1 \2B/') / $(echo "$disk_total" | sed -E 's/([0-9.]+)([KMGT])/\1 \2B/') (${disk_pct}%)"
+}
+
+collect_load() {
+    read -r load1 load5 load15 _ < /proc/loadavg 2>/dev/null
+    load1=${load1:-0}; load5=${load5:-0}; load15=${load15:-0}
+    procs=$(ls -d /proc/[0-9]* 2>/dev/null | wc -l)
+}
+
+collect_temp() {
+    temp_c=""
+    local h n t
+    for h in /sys/class/hwmon/hwmon*; do
+        n=$(cat "$h/name" 2>/dev/null)
+        case "$n" in
+            coretemp|k10temp|zenpower|cpu_thermal|soc_thermal)
+                t=$(cat "$h/temp1_input" 2>/dev/null)
+                [ -n "$t" ] && { temp_c=$((t / 1000)); return; } ;;
+        esac
+    done
+    t=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null)
+    [ -n "$t" ] && temp_c=$((t / 1000))
+}
+
+collect_net() {
+    iface=$(default_iface)
+    ip_priv=""; ip_pub=""
+    [ -n "$iface" ] && ip_priv=$(ip -4 -o addr show dev "$iface" 2>/dev/null | awk '{sub(/\/.*/,"",$4); print $4; exit}')
+    [ -z "$ip_priv" ] && ip_priv=$(hostname -I 2>/dev/null | awk '{print $1}')
+}
+
+collect_guests() {
+    lxc_run=0; lxc_all=0; vm_run=0; vm_all=0; dk_run=0; dk_all=0
+    if have pct; then
+        lxc_all=$(timeout 3 pct list 2>/dev/null | awk 'NR>1' | wc -l)
+        lxc_run=$(timeout 3 pct list 2>/dev/null | awk 'NR>1 && $2=="running"' | wc -l)
+    fi
+    if have qm; then
+        vm_all=$(timeout 3 qm list 2>/dev/null | awk 'NR>1' | wc -l)
+        vm_run=$(timeout 3 qm list 2>/dev/null | awk 'NR>1 && $3=="running"' | wc -l)
+    fi
+    if have docker; then
+        dk_run=$(timeout 3 docker ps -q 2>/dev/null | wc -l)
+        dk_all=$(timeout 3 docker ps -aq 2>/dev/null | wc -l)
+    fi
+    guests_str=""
+    [ "$lxc_all" -gt 0 ] && guests_str="LXC ${lxc_run}/${lxc_all}"
+    [ "$vm_all" -gt 0 ]  && guests_str="${guests_str:+$guests_str  }VM ${vm_run}/${vm_all}"
+    [ "$dk_all" -gt 0 ]  && guests_str="${guests_str:+$guests_str  }Docker ${dk_run}/${dk_all}"
+}
+
+collect_gpu() {
+    gpu=""
+    have lspci && gpu=$(lspci 2>/dev/null | grep -iE 'vga|3d controller|display controller' | head -n1 | sed -E 's/^[^ ]+ [^:]+: //; s/ \(rev [0-9a-f]+\)//')
+}
+
+collect_failed() {
+    failed_units=0
+    have systemctl && failed_units=$(systemctl --failed --no-legend --plain 2>/dev/null | wc -l)
+}
+
+collect_pkgs() {
+    pkgs=""
+    if have dpkg-query; then pkgs="$(dpkg-query -f '.\n' -W 2>/dev/null | wc -l) (dpkg)"
+    elif have rpm; then pkgs="$(rpm -qa 2>/dev/null | wc -l) (rpm)"
+    elif have pacman; then pkgs="$(pacman -Qq 2>/dev/null | wc -l) (pacman)"
+    elif have apk; then pkgs="$(apk info 2>/dev/null | wc -l) (apk)"; fi
+}
+
+cpu_sample() { awk '/^cpu /{idle=$5+$6; t=0; for(i=2;i<=NF;i++) t+=$i; print idle, t}' /proc/stat; }
+
+# ------------------------------------------------------------------------------
+# Flag: Version / Help
+# ------------------------------------------------------------------------------
+# ---- plugins ---------------------------------------------------------------
+# *.sh files in /etc/mythstat.d and ~/.config/mythstat/plugins are sourced if
+# owned by root or the current user and not group/world-writable.
+# A plugin may define: mythstat_cmd_<name>() for --<name>, mythstat_plugin_help(),
+# and mythstat_hook_end() (runs after a normal fetch).
+for _pd in "${MYTHSTAT_PLUGIN_DIR:-/etc/mythstat.d}" "${XDG_CONFIG_HOME:-$HOME/.config}/mythstat/plugins"; do
+    [ -d "$_pd" ] || continue
+    for _pf in "$_pd"/*.sh; do
+        [ -f "$_pf" ] || continue
+        _own=$(stat -c %u "$_pf" 2>/dev/null); _mode=$(stat -c %a "$_pf" 2>/dev/null)
+        { [ "$_own" = 0 ] || [ "$_own" = "$(id -u)" ]; } || continue
+        case "$_mode" in *[2367]?|*[2367]) continue ;; esac
+        . "$_pf" 2>/dev/null
+    done
+done
+if [[ "$CMD" == --* ]]; then
+    _fn="mythstat_cmd_${CMD#--}"; _fn="${_fn//-/_}"
+    if declare -F "$_fn" >/dev/null; then shift; "$_fn" "$@"; exit $?; fi
+fi
+
+if [ "$CMD" = "--version" ] || [ "$CMD" = "-v" ]; then
+    echo -e "${c_cyan}MythStat${c0} version ${c_green}${MY_VERSION}${c0}"
+    exit 0
+fi
+
+if [ "$CMD" = "--help" ] || [ "$CMD" = "-h" ]; then
+    echo -e "${c_cyan}${bold}MythStat v${MY_VERSION}${c0} - Lightweight Server Fetch & Monitoring Tool"
+    echo -e "${dim}https://myth3x.com/mythstat${c0}\n"
+    echo -e "Usage: ${bold}mythstat${c0} [options]\n"
+    echo -e "Info:"
+    echo -e "  ${c_blue}(no options)${c0}     Server specs (standard fetch)"
+    echo -e "  ${c_blue}-j, --json${c0}       Machine-readable output (for scripts / monitoring)"
+    echo -e "  ${c_blue}-w, --watch [s]${c0}  Live dashboard: CPU, RAM, load, net speed, top processes"
+    echo -e "  ${c_blue}-d, --disks${c0}      All mounted filesystems with usage bars"
+    echo -e "  ${c_blue}-n, --net${c0}        Interfaces, IPs, traffic totals and live speed"
+    echo -e "  ${c_blue}-t, --top${c0}        Top processes by CPU and memory"
+    echo -e "  ${c_blue}-s, --services${c0}   Failed systemd units and key service status"
+    echo -e "  ${c_blue}-p, --ports${c0}      Open ports and listening services"
+    echo -e "  ${c_blue}-b, --bench${c0}      Mini-benchmark (disk write, CPU, ping)"
+    echo -e "Monitoring:"
+    echo -e "  ${c_blue}-c, --check${c0}      Check thresholds; exit 1 if any warning (cron friendly)"
+    echo -e "                     Config: ${dim}${CONF}${c0}"
+    echo -e "                     MYTHSTAT_RAM_WARN / DISK_WARN / SWAP_WARN / TEMP_WARN / LOAD_WARN"
+    echo -e "                     MYTHSTAT_WEBHOOK=<Discord/Slack-compatible URL> to be notified"
+    echo -e "System:"
+    echo -e "  ${c_blue}-m, --motd${c0}       Show MythStat on every SSH login"
+    echo -e "  ${c_blue}--unmotd${c0}         Disable the SSH login banner"
+    echo -e "  ${c_blue}-u, --update${c0}     Check and install updates manually"
+    echo -e "  ${c_blue}--install${c0}        Copy this script to your PATH"
+    echo -e "  ${c_blue}--no-color${c0}       Disable colors (also honours NO_COLOR)"
+    echo -e "  ${c_blue}--offline${c0}        Never touch the network for this run"
+    echo -e "  ${c_blue}-v, --version${c0}    Print version"
+    echo -e "  ${c_blue}-h, --help${c0}       This help"
+    declare -F mythstat_plugin_help >/dev/null && { echo -e "Plugins:"; mythstat_plugin_help; }
+    exit 0
+fi
+# ------------------------------------------------------------------------------
+# Flag: Update (Manual)
+# ------------------------------------------------------------------------------
+if [ "$1" = "--update" ] || [ "$1" = "-u" ]; then
+    echo -e "${c_blue}[MythStat]${c0} Checking for updates..."
+    
+    TARGET_BIN=$(command -v mythstat 2>/dev/null || echo "$SCRIPT_PATH")
+    if [[ "$TARGET_BIN" == *"/bash"* ]] || [[ "$TARGET_BIN" == *"/sh"* ]] || [ ! -f "$TARGET_BIN" ]; then
+        TARGET_BIN="/usr/local/bin/mythstat"
+        [ ! -w /usr/local/bin ] && [ -w /usr/bin ] && TARGET_BIN="/usr/bin/mythstat"
+    fi
+
+    tmp_file=$(mktemp) || exit 1
+    trap 'rm -f "$tmp_file"' EXIT
+    if ! curl -4 -sfL --connect-timeout 3 --max-time 10 "${MYTHSTAT_UPDATE_URL:-https://myth3x.com/mythstat}" -o "$tmp_file"; then
+        echo -e "${c_red}[MythStat]${c0} Error connecting to the update server."; exit 1
+    fi
+    want=$(curl -4 -sfL --connect-timeout 3 --max-time 10 "${MYTHSTAT_UPDATE_URL:-https://myth3x.com/mythstat}.sha256" | awk '{print $1}')
+    got=$(sha256sum "$tmp_file" | awk '{print $1}')
+    if [ -z "$want" ] || [ "$want" != "$got" ]; then
+        echo -e "${c_red}[MythStat]${c0} Refusing update: SHA256 missing or mismatch."; exit 1
+    fi
+    new_ver=$(grep -m1 '^MY_VERSION=' "$tmp_file" | cut -d'"' -f2)
+    if [ -z "$new_ver" ] || [ "$(printf '%s\n%s\n' "$MY_VERSION" "$new_ver" | sort -V | tail -1)" = "$MY_VERSION" ]; then
+        echo -e "${c_green}[MythStat]${c0} You are already running the latest version (${MY_VERSION})."; exit 0
+    fi
+    if [ -w "$TARGET_BIN" ] || [ -w "$(dirname "$TARGET_BIN")" ]; then
+        chmod +x "$tmp_file" && mv -f "$tmp_file" "$TARGET_BIN" &&
+        echo -e "${c_green}[MythStat]${c0} Updated v${MY_VERSION} -> ${bold}v${new_ver}${c0}"
+    else
+        echo -e "${c_red}[MythStat]${c0} No write permission for $TARGET_BIN (run: sudo mythstat --update)."; exit 1
+    fi
+    exit 0
+fi
+
+# ------------------------------------------------------------------------------
+# Flag: MOTD / Auto-run on SSH login
+# ------------------------------------------------------------------------------
+if [ "$1" = "--motd" ] || [ "$1" = "-m" ]; then
+    if [ -w /etc/profile.d ]; then
+        echo -e "#!/bin/sh\n[ -z \"$MYTHSTAT_SHOWN\" ] && [ -t 1 ] && export MYTHSTAT_SHOWN=1 && /usr/bin/mythstat" > /etc/profile.d/mythstat.sh
+        chmod +x /etc/profile.d/mythstat.sh
+        echo -e "${c_green}[MythStat]${c0} Enabled as SSH Welcome Banner (/etc/profile.d/mythstat.sh)!"
+    else
+        grep -q "mythstat" ~/.bashrc 2>/dev/null || echo "[ -z \"$MYTHSTAT_SHOWN\" ] && [ -t 1 ] && export MYTHSTAT_SHOWN=1 && /usr/bin/mythstat" >> ~/.bashrc
+        echo -e "${c_green}[MythStat]${c0} Enabled in ~/.bashrc on SSH login!"
+    fi
+    exit 0
+fi
+
+if [ "$1" = "--unmotd" ]; then
+    rm -f /etc/profile.d/mythstat.sh 2>/dev/null
+    sed -i "/mythstat/d" ~/.bashrc 2>/dev/null
+    echo -e "${c_yellow}[MythStat]${c0} SSH login Welcome Banner disabled."
+    exit 0
+fi
+
+# ------------------------------------------------------------------------------
+# Flag: Mini-Benchmark (--bench / -b)
+# ------------------------------------------------------------------------------
+if [ "$1" = "--bench" ] || [ "$1" = "-b" ]; then
+    echo ""
+    echo -e "  ${c_cyan}${bold}=== MythStat Quick Benchmark ===${c0}"
+    echo -e "  ${dim}Measures SSD/NVMe write speed, CPU hashing power and network latency${c0}\n"
+
+    # 1. Disk I/O Write Test
+    echo -ne "  ${c_blue}Disk Write Speed (128 MB):  ${c0} "
+    bench_file="/tmp/.mythstat_bench"
+    dd_out=$(dd if=/dev/zero of="$bench_file" bs=1M count=128 conv=fdatasync 2>&1)
+    rm -f "$bench_file"
+    speed=$(echo "$dd_out" | grep -oE "[0-9.]+ [kMG]?B/s" | tail -n 1)
+    [ -z "$speed" ] && speed="N/A"
+    echo -e "${c_green}${bold}$speed${c0}"
+
+    # 2. CPU Hashing Speed
+    echo -ne "  ${c_blue}CPU Hashing Power (SHA256): ${c0} "
+    t_start=$(date +%s%N)
+    dd if=/dev/zero bs=1M count=120 2>/dev/null | sha256sum >/dev/null
+    t_end=$(date +%s%N)
+    dur_ms=$(((t_end - t_start) / 1000000))
+    mb_s=$(( (120 * 1000) / (dur_ms > 0 ? dur_ms : 1) ))
+    echo -e "${c_green}${bold}~${mb_s} MB/s${c0} ${dim}(completed in ${dur_ms} ms)${c0}"
+
+    # 3. Network Latency
+    echo -ne "  ${c_blue}Ping Cloudflare (1.1.1.1):   ${c0} "
+    ping_cf=$(ping -c 2 -W 1 1.1.1.1 2>/dev/null | awk -F"/" 'END {print $5}')
+    if [ -n "$ping_cf" ]; then
+        echo -e "${c_green}${bold}${ping_cf} ms${c0}"
+    else
+        echo -e "${c_yellow}Timeout / ICMP blocked${c0}"
+    fi
+
+    echo -ne "  ${c_blue}Ping Google DNS (8.8.8.8):   ${c0} "
+    ping_gg=$(ping -c 2 -W 1 8.8.8.8 2>/dev/null | awk -F"/" 'END {print $5}')
+    if [ -n "$ping_gg" ]; then
+        echo -e "${c_green}${bold}${ping_gg} ms${c0}"
+    else
+        echo -e "${c_yellow}Timeout / ICMP blocked${c0}"
+    fi
+    echo ""
+    exit 0
+fi
+
+# ------------------------------------------------------------------------------
+# Flag: Open Ports (--ports / -p)
+# ------------------------------------------------------------------------------
+if [ "$1" = "--ports" ] || [ "$1" = "-p" ]; then
+    echo ""
+    echo -e "  ${c_cyan}${bold}=== Active Ports & Listening Services ===${c0}\n"
+    printf "  ${bold}%-7s %-24s %-20s${c0}\n" "PROTO" "LOCAL ADDRESS:PORT" "PROCESS / SERVICE"
+    printf "  %-7s %-24s %-20s\n" "-------" "------------------------" "--------------------"
+    
+    if command -v ss >/dev/null 2>&1; then
+        ss -tulpn 2>/dev/null | awk 'NR>1 {
+            proto=$1; addr=$5; proc=$7;
+            gsub(/users:\(\(/, "", proc); gsub(/,.*/, "", proc); gsub(/"/, "", proc);
+            if (proc == "") proc="-";
+            printf "  %-7s %-24s %-20s\n", proto, addr, proc
+        }' | head -n 25
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -tulpn 2>/dev/null | awk 'NR>2 {
+            proto=$1; addr=$4; proc=$7;
+            gsub(/[0-9]+\//, "", proc);
+            if (proc == "") proc="-";
+            printf "  %-7s %-24s %-20s\n", proto, addr, proc
+        }' | head -n 25
+    else
+        echo -e "  ${c_red}ss or netstat command not available.${c0}"
+    fi
+    echo ""
+    exit 0
+fi
+
+# ------------------------------------------------------------------------------
+# Flag: JSON (--json / -j)
+# ------------------------------------------------------------------------------
+if [ "$CMD" = "--json" ] || [ "$CMD" = "-j" ]; then
+    collect_basic; collect_mem; collect_disk; collect_load; collect_temp; collect_net; collect_guests; collect_gpu; collect_failed; collect_pkgs
+    printf '{'
+    printf '"version":"%s","host":"%s","user":"%s",' "$MY_VERSION" "$(jesc "$(hostname)")" "$(jesc "$(whoami)")"
+    printf '"os":"%s","arch":"%s","kernel":"%s","virt":"%s",' "$(jesc "$os_name")" "$arch" "$(jesc "$kernel")" "$(jesc "${virt# (}" | tr -d ')')"
+    printf '"uptime_seconds":%s,' "${up_sec:-0}"
+    printf '"cpu":{"model":"%s","cores":%s,"temp_c":%s},' "$(jesc "$cpu_model")" "$cores" "${temp_c:-null}"
+    printf '"load":[%s,%s,%s],"processes":%s,' "$load1" "$load5" "$load15" "$procs"
+    printf '"ram":{"total_mb":%s,"used_mb":%s,"percent":%s},' "$ram_total_mb" "$ram_used_mb" "$ram_pct"
+    printf '"swap":{"total_mb":%s,"used_mb":%s,"percent":%s},' "$swap_total_mb" "$swap_used_mb" "$swap_pct"
+    printf '"disk":{"root_percent":%s,"root_used":"%s","root_total":"%s","type":"%s"},' "$disk_pct" "$disk_used" "$disk_total" "$disk_type"
+    printf '"network":{"interface":"%s","ip":"%s"},' "$(jesc "$iface")" "$(jesc "$ip_priv")"
+    printf '"guests":{"lxc_running":%s,"lxc_total":%s,"vm_running":%s,"vm_total":%s,"docker_running":%s,"docker_total":%s},' "$lxc_run" "$lxc_all" "$vm_run" "$vm_all" "$dk_run" "$dk_all"
+    printf '"gpu":"%s","failed_units":%s,"packages":"%s"' "$(jesc "$gpu")" "$failed_units" "$(jesc "$pkgs")"
+    printf '}\n'
+    exit 0
+fi
+
+# ------------------------------------------------------------------------------
+# Flag: Disks (--disks / -d)
+# ------------------------------------------------------------------------------
+if [ "$CMD" = "--disks" ] || [ "$CMD" = "-d" ]; then
+    echo ""
+    echo -e "  ${c_cyan}${bold}=== Filesystems ===${c0}\n"
+    printf "  ${bold}%-22s %-7s %-16s %s${c0}\n" "MOUNT" "FS" "USED / TOTAL" "USAGE"
+    df -hT -x tmpfs -x devtmpfs -x overlay -x squashfs -x efivarfs -x fuse.lxcfs 2>/dev/null | awk 'NR>1 && $2!="" {p=$6; gsub(/%/,"",p); print $7, $2, $4, $3, p}' |
+    while read -r mnt fs used total pct; do
+        [[ "$mnt" == /sys* || "$mnt" == /proc* || "$mnt" == /run* ]] && continue
+        printf "  %-22s %-7s %-16s " "${mnt:0:22}" "$fs" "$used / $total"
+        draw_bar "${pct:-0}" 14; printf " %s%%\n" "$pct"
+    done
+    echo ""
+    if have lsblk; then
+        echo -e "  ${c_cyan}${bold}Physical drives${c0}"
+        lsblk -dno NAME,SIZE,ROTA,MODEL 2>/dev/null | grep -v '^loop\|^zd\|^ram' | awk '{r=($3=="1")?"HDD":"SSD"; if ($1 ~ /^nvme/) r="NVMe"; m=""; for(i=4;i<=NF;i++) m=m" "$i; printf "  %-10s %-8s %-5s%s\n", $1, $2, r, m}'
+        echo ""
+    fi
+    exit 0
+fi
+
+# ------------------------------------------------------------------------------
+# Flag: Network (--net / -n)
+# ------------------------------------------------------------------------------
+if [ "$CMD" = "--net" ] || [ "$CMD" = "-n" ]; then
+    collect_net
+    echo ""
+    echo -e "  ${c_cyan}${bold}=== Network ===${c0}\n"
+    echo -e "  ${c_blue}Default iface:${c0} ${iface:-n/a}   ${c_blue}IP:${c0} ${ip_priv:-n/a}"
+    if [ -z "$MYTHSTAT_NO_NET" ] && have curl; then
+        pub=$(curl -4 -s --max-time 3 https://api.ipify.org 2>/dev/null)
+        echo -e "  ${c_blue}Public IP:${c0}     ${pub:-unavailable}"
+    fi
+    echo ""
+    declare -A rx0 tx0
+    ifs=$(sed 's/:/ /' /proc/net/dev | awk 'NR>2 && $1!="lo" && $1!~/^(veth|fwbr|fwpr|fwln|tap)/ {print $1}')
+    for i in $ifs; do read -r rx0[$i] tx0[$i] < <(net_bytes "$i"); done
+    sleep 1
+    printf "  ${bold}%-14s %-10s %-12s %-12s %-12s %s${c0}\n" "IFACE" "STATE" "RX TOTAL" "TX TOTAL" "RX/s" "TX/s"
+    for i in $ifs; do
+        read -r rx tx < <(net_bytes "$i")
+        st=$(cat /sys/class/net/$i/operstate 2>/dev/null)
+        printf "  %-14s %-10s %-12s %-12s %-12s %s\n" "$i" "${st:-?}" "$(human_bytes "$rx")" "$(human_bytes "$tx")" "$(human_bytes $((rx - ${rx0[$i]:-0})))" "$(human_bytes $((tx - ${tx0[$i]:-0})))"
+    done
+    echo ""
+    exit 0
+fi
+
+# ------------------------------------------------------------------------------
+# Flag: Top processes (--top / -t)
+# ------------------------------------------------------------------------------
+if [ "$CMD" = "--top" ] || [ "$CMD" = "-t" ]; then
+    echo ""
+    echo -e "  ${c_cyan}${bold}=== Top by CPU ===${c0}"
+    printf "  ${bold}%-7s %-6s %-6s %s${c0}\n" "PID" "CPU%" "MEM%" "COMMAND"
+    ps -eo pid,pcpu,pmem,comm --sort=-pcpu 2>/dev/null | awk 'NR>1 && $4!="ps" && ++n<=8 {printf "  %-7s %-6s %-6s %s\n", $1,$2,$3,$4}'
+    echo ""
+    echo -e "  ${c_cyan}${bold}=== Top by Memory ===${c0}"
+    printf "  ${bold}%-7s %-6s %-9s %s${c0}\n" "PID" "MEM%" "RSS" "COMMAND"
+    ps -eo pid,pmem,rss,comm --sort=-rss 2>/dev/null | awk 'NR>1 && NR<=9 {printf "  %-7s %-6s %-9s %s\n", $1,$2,sprintf("%.0f MB",$3/1024),$4}'
+    echo ""
+    exit 0
+fi
+
+# ------------------------------------------------------------------------------
+# Flag: Services (--services / -s)
+# ------------------------------------------------------------------------------
+if [ "$CMD" = "--services" ] || [ "$CMD" = "-s" ]; then
+    echo ""
+    if ! have systemctl; then echo -e "  ${c_red}systemctl not available.${c0}\n"; exit 0; fi
+    echo -e "  ${c_cyan}${bold}=== Services ===${c0}\n"
+    nrun=$(systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null | wc -l)
+    echo -e "  ${c_blue}Running services:${c0} ${nrun}"
+    failed=$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}')
+    if [ -z "$failed" ]; then
+        echo -e "  ${c_green}✓ No failed units${c0}"
+    else
+        echo -e "  ${c_red}✗ Failed units:${c0}"
+        echo "$failed" | sed 's/^/    - /'
+    fi
+    echo ""
+    echo -e "  ${c_blue}Common services${c0}"
+    for s in ssh sshd nginx apache2 httpd mariadb mysql postgresql redis-server docker fail2ban ufw cron pveproxy pvedaemon php-fpm; do
+        systemctl list-unit-files "$s.service" --no-legend 2>/dev/null | grep -q . || continue
+        st=$(systemctl is-active "$s" 2>/dev/null)
+        if [ "$st" = "active" ]; then col="$c_green"; else col="$c_red"; fi
+        printf "    %-16s ${col}%s${c0}\n" "$s" "$st"
+    done
+    echo ""
+    exit 0
+fi
+
+# ------------------------------------------------------------------------------
+# Flag: Check thresholds (--check / -c)
+# ------------------------------------------------------------------------------
+if [ "$CMD" = "--check" ] || [ "$CMD" = "-c" ]; then
+    RAM_W=${MYTHSTAT_RAM_WARN:-90}; DISK_W=${MYTHSTAT_DISK_WARN:-90}; SWAP_W=${MYTHSTAT_SWAP_WARN:-80}
+    TEMP_W=${MYTHSTAT_TEMP_WARN:-85}; LOAD_W=${MYTHSTAT_LOAD_WARN:-1.5}
+    collect_basic; collect_mem; collect_disk; collect_load; collect_temp; collect_failed
+    warns=()
+    [ "$ram_pct" -ge "$RAM_W" ] && warns+=("RAM ${ram_pct}% (>= ${RAM_W}%)")
+    [ "$swap_pct" -ge "$SWAP_W" ] && [ "$swap_total_mb" -gt 0 ] && warns+=("Swap ${swap_pct}% (>= ${SWAP_W}%)")
+    while read -r mnt pct; do
+        [ "${pct:-0}" -ge "$DISK_W" ] && warns+=("Disk $mnt ${pct}% (>= ${DISK_W}%)")
+    done < <(df -P -x tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null | awk 'NR>1 {p=$5; gsub(/%/,"",p); print $6, p}')
+    [ -n "$temp_c" ] && [ "$temp_c" -ge "$TEMP_W" ] && warns+=("CPU temp ${temp_c}°C (>= ${TEMP_W}°C)")
+    awk -v l="$load1" -v c="$cores" -v w="$LOAD_W" 'BEGIN{exit !(l/c >= w)}' && warns+=("Load ${load1} on ${cores} cores (>= ${LOAD_W}x)")
+    [ "$failed_units" -gt 0 ] && warns+=("${failed_units} failed systemd unit(s)")
+    if [ ${#warns[@]} -eq 0 ]; then
+        echo -e "${c_green}OK${c0} ${user_host}: all checks passed"
+        exit 0
+    fi
+    echo -e "${c_red}WARN${c0} ${user_host}:"
+    for w in "${warns[@]}"; do echo "  - $w"; done
+    if [ -n "$MYTHSTAT_WEBHOOK" ] && [ -z "$MYTHSTAT_NO_NET" ] && have curl; then
+        msg="MythStat ${user_host}: $(printf '%s; ' "${warns[@]}")"
+        body="{\"content\":\"$(jesc "$msg")\",\"text\":\"$(jesc "$msg")\"}"
+        curl -4 -s --max-time 5 -H "Content-Type: application/json" -d "$body" "$MYTHSTAT_WEBHOOK" >/dev/null 2>&1
+    fi
+    exit 1
+fi
+
+# ------------------------------------------------------------------------------
+# Flag: Live dashboard (--watch / -w [seconds])
+# ------------------------------------------------------------------------------
+if [ "$CMD" = "--watch" ] || [ "$CMD" = "-w" ]; then
+    iv=${2:-2}
+    [[ "$iv" =~ ^[0-9]+$ ]] && [ "$iv" -ge 1 ] || iv=2
+    collect_basic; iface=$(default_iface)
+    trap 'printf "\033[?25h\033[?1049l"; exit 0' INT TERM
+    printf "\033[?1049h\033[?25l"
+    read -r idle0 tot0 < <(cpu_sample)
+    read -r rx0 tx0 < <(net_bytes "$iface")
+    while true; do
+        sleep "$iv"
+        read -r idle1 tot1 < <(cpu_sample)
+        read -r rx1 tx1 < <(net_bytes "$iface")
+        dt=$((tot1 - tot0)); di=$((idle1 - idle0))
+        cpu_pct=0; [ $dt -gt 0 ] && cpu_pct=$(( (100 * (dt - di)) / dt ))
+        idle0=$idle1; tot0=$tot1
+        rxs=$(( (${rx1:-0} - ${rx0:-0}) / iv )); txs=$(( (${tx1:-0} - ${tx0:-0}) / iv )); rx0=$rx1; tx0=$tx1
+        collect_mem; collect_load; collect_temp
+        printf "\033[H\033[2J"
+        echo -e "\n  ${c_cyan}${bold}MythStat live${c0}  ${dim}${user_host} · every ${iv}s · Ctrl-C to quit${c0}\n"
+        printf "  ${c_blue}%-7s${c0} " "CPU";  draw_bar "$cpu_pct" 24; printf " %3d%%   %s\n" "$cpu_pct" "${temp_c:+${temp_c}°C}"
+        printf "  ${c_blue}%-7s${c0} " "RAM";  draw_bar "$ram_pct" 24; printf " %3d%%   %s\n" "$ram_pct" "$(fmt_mem "$ram_used_mb" "$ram_total_mb" "$ram_pct")"
+        [ "$swap_total_mb" -gt 0 ] && { printf "  ${c_blue}%-7s${c0} " "Swap"; draw_bar "$swap_pct" 24; printf " %3d%%\n" "$swap_pct"; }
+        printf "  ${c_blue}%-7s${c0} %s %s %s   ${dim}(%s cores, %s procs)${c0}\n" "Load" "$load1" "$load5" "$load15" "$cores" "$procs"
+        printf "  ${c_blue}%-7s${c0} ↓ %s/s   ↑ %s/s   ${dim}(%s)${c0}\n\n" "Net" "$(human_bytes "$rxs")" "$(human_bytes "$txs")" "${iface:-n/a}"
+        printf "  ${bold}%-7s %-6s %-6s %s${c0}\n" "PID" "CPU%" "MEM%" "COMMAND"
+        ps -eo pid,pcpu,pmem,comm --sort=-pcpu 2>/dev/null | awk 'NR>1 && $4!="ps" && ++n<=8 {printf "  %-7s %-6s %-6s %s\n", $1,$2,$3,$4}'
+    done
+fi
+
+
+# ------------------------------------------------------------------------------
+# Standard Fetch Mode
+# ------------------------------------------------------------------------------
+collect_basic; collect_mem; collect_disk; collect_load; collect_temp; collect_net; collect_guests; collect_gpu; collect_failed; collect_pkgs
+
+sep=$(printf "%*s" "${#user_host}" "" | tr " " "-")
+if [ -n "$NO_COLOR" ]; then dots=""; else
+dots="\033[40m   \033[41m   \033[42m   \033[43m   \033[44m   \033[45m   \033[46m   \033[47m   \033[0m"; fi
+
+# Distro ASCII Art
+case "$distro_id" in
+    ubuntu)
+        ac="$c_red"
+        l1="         _   "
+        l2="     ---(_)  "
+        l3=" _/  ---  \\  "
+        l4="(_) |   |    "
+        l5="  \\  --- _/  "
+        l6="     ---(_)  "
+        l7="             "
+        l8="             "
+        l9="             "
+        ;;
+    debian)
+        ac="$c_red"
+        l1="  _____      "
+        l2=" /  __ \\     "
+        l3="|  /    |    "
+        l4="|  \\___-     "
+        l5="-_           "
+        l6="  --_        "
+        l7="             "
+        l8="             "
+        l9="             "
+        ;;
+    arch)
+        ac="$c_cyan"
+        l1="      /\\     "
+        l2="     /  \\    "
+        l3="    /\\   \\   "
+        l4="   /      \\  "
+        l5="  /   ,,   \\ "
+        l6=" /__--  --__\\"
+        l7="             "
+        l8="             "
+        l9="             "
+        ;;
+    alpine)
+        ac="$c_blue"
+        l1="   /\\        "
+        l2="  //\\\\       "
+        l3=" //  \\\\  /\\  "
+        l4="//    \\\\//\\\\ "
+        l5="/      //  \\\\"
+        l6="      //    \\"
+        l7="             "
+        l8="             "
+        l9="             "
+        ;;
+    centos|rhel|rocky|alma)
+        ac="$c_green"
+        l1="  ____ ___   "
+        l2=" |  _ \\_ _|  "
+        l3=" | |_) | |   "
+        l4=" |  _ <| |   "
+        l5=" |_| \\_\\_|   "
+        l6="             "
+        l7="             "
+        l8="             "
+        l9="             "
+        ;;
+    *)
+        ac="$c_cyan"
+        l1="   .--.      "
+        l2="  |o_o |     "
+        l3="  |:_/ |     "
+        l4=" //   \\ \\    "
+        l5="(\"|\"  \"|\")   "
+        l6=" /\"_   _\"\\   "
+        l7="             "
+        l8="             "
+        l9="             "
+        ;;
+esac
+
+BAR=$(draw_bar "$ram_pct"); SBAR=$(draw_bar "$swap_pct"); DBAR=$(draw_bar "$disk_pct")
+lbl() { printf "${bold}${c_blue}%-11s${c0}" "$1"; }
+rows=()
+rows+=("$(printf "${bold}${c_magenta}%s${c0}" "$user_host")")
+rows+=("$(printf "${c_white}%s${c0}" "$sep")")
+rows+=("$(lbl OS:)$os_name $arch$virt")
+rows+=("$(lbl Kernel:)$kernel")
+rows+=("$(lbl Uptime:)$uptime_str")
+[ -n "$pkgs" ] && rows+=("$(lbl Packages:)$pkgs")
+rows+=("$(lbl CPU:)$cpu_model ($cores vCPU)${temp_c:+ @ ${temp_c}°C}")
+[ -n "$gpu" ] && rows+=("$(lbl GPU:)$gpu")
+rows+=("$(lbl Load:)$load1 $load5 $load15  ${dim}($procs procs)${c0}")
+rows+=("$(lbl RAM:)$BAR $(fmt_mem "$ram_used_mb" "$ram_total_mb" "$ram_pct")")
+[ "$swap_total_mb" -gt 0 ] && rows+=("$(lbl Swap:)$SBAR $(fmt_mem "$swap_used_mb" "$swap_total_mb" "$swap_pct")")
+rows+=("$(lbl 'Disk (/):')$DBAR $disk_str [$disk_type]")
+[ -n "$ip_priv" ] && rows+=("$(lbl IP:)$ip_priv${iface:+ ($iface)}")
+[ -n "$guests_str" ] && rows+=("$(lbl Guests:)$guests_str")
+if [ "$failed_units" -gt 0 ]; then rows+=("$(lbl Services:)${c_red}${failed_units} failed unit(s)${c0} ${dim}(mythstat -s)${c0}")
+elif have systemctl; then rows+=("$(lbl Services:)${c_green}all OK${c0}"); fi
+rows+=("$dots")
+
+art=("$l1" "$l2" "$l3" "$l4" "$l5" "$l6" "$l7" "$l8" "$l9")
+echo ""
+n=${#rows[@]}; [ ${#art[@]} -gt $n ] && n=${#art[@]}
+for ((i=0; i<n; i++)); do
+    a="${art[$i]:-             }"
+    printf "  ${ac}%s${c0}  %b\n" "$a" "${rows[$i]}"
+done
+echo ""
+
+# ------------------------------------------------------------------------------
+# Update Notification Banner (Shown if a newer version was detected)
+# ------------------------------------------------------------------------------
+if [ -f /tmp/.mythstat_new_ver ]; then
+    avail_ver=$(cat /tmp/.mythstat_new_ver 2>/dev/null | tr -d '[:space:]')
+    if [ -n "$avail_ver" ] && [ "$avail_ver" != "$MY_VERSION" ]; then
+        echo -e "  ${c_yellow}╭───────────────────────────────────────────────────────────╮${c0}"
+        echo -e "  ${c_yellow}│${c0}  ${bold}🔔 Update available:${c0} ${dim}v${MY_VERSION}${c0} → ${c_green}${bold}v${avail_ver}${c0}                        ${c_yellow}│${c0}"
+        echo -e "  ${c_yellow}│${c0}  To update now, run: ${c_cyan}${bold}mythstat -u${c0}                         ${c_yellow}│${c0}"
+        echo -e "  ${c_yellow}╰───────────────────────────────────────────────────────────╯${c0}\n"
+    else
+        rm -f /tmp/.mythstat_new_ver 2>/dev/null
+    fi
+fi
+
+
+# ------------------------------------------------------------------------------
+# Flag: Install to PATH (explicit, never automatic)
+# ------------------------------------------------------------------------------
+if [ "$1" = "--install" ]; then
+    INSTALL_TARGET=""
+    if [ -w /usr/local/bin ]; then INSTALL_TARGET="/usr/local/bin/mythstat"
+    elif [ -w /usr/bin ]; then INSTALL_TARGET="/usr/bin/mythstat"
+    elif [ -n "$HOME" ] && [ -w "$HOME" ]; then
+        mkdir -p "$HOME/.local/bin" 2>/dev/null; INSTALL_TARGET="$HOME/.local/bin/mythstat"
+        [[ ":$PATH:" != *":$HOME/.local/bin:"* ]] && echo 'Add to PATH: export PATH="$HOME/.local/bin:$PATH"'
+    fi
+    if [ -n "$INSTALL_TARGET" ] && [ -f "$SCRIPT_PATH" ] && cp -f "$SCRIPT_PATH" "$INSTALL_TARGET" && chmod +x "$INSTALL_TARGET"; then
+        echo -e "${c_green}[MythStat]${c0} Installed to $INSTALL_TARGET"
+    else
+        echo -e "${c_red}[MythStat]${c0} Install failed (need a local file and a writable bin dir)."; exit 1
+    fi
+    exit 0
+fi
+
+# Plugin hook: runs at the end of a normal fetch (e.g. private integrations)
+declare -F mythstat_hook_end >/dev/null && mythstat_hook_end
+
+exit 0
